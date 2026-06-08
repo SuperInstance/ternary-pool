@@ -1,26 +1,50 @@
 # ternary-pool
 
-**Downsampling that speaks ternary — eight ways to collapse {-1, 0, +1} matrices.**
+Downsampling operations for matrices where every element is {−1, 0, +1}.
 
-[![crate](https://img.shields.io/badge/crates.io-ternary--pool-orange)](https://crates.io)
-[![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+## The Problem
 
-## Why This Exists
+After convolution in a ternary neural network, you have feature maps — matrices of trits — that are too large. You need to reduce spatial dimensions while preserving the signal. Standard pooling (max, average) works for floats, but ternary space has different semantics: zero isn't "small," it's "neutral." When you average {-1, +1, +1, -1} and get 0, you've lost the information that there was strong signal in both directions. The mean is uninformative.
 
-After convolution, you need to shrink. Pooling reduces spatial dimensions while keeping the important signals — it's what makes deep networks computationally tractable. But standard pooling assumes floating-point values. Max pooling picks the largest number. Average pooling computes a mean. These operations have clear semantics in ℝ.
+The problem: you need pooling operations that understand ternary structure — that zero is a meaningful vote, that {-1, 0, +1} form a group, and that "majority" is a more natural aggregation than "mean" when values are discrete opinions.
 
-In ternary space {-1, 0, +1}, pooling takes on new meaning. "Max" becomes a three-way comparison. "Average" becomes a sign vote. And a new operation appears — **majority pooling** — that has no float analog. It's a vote among elements, and it's naturally noise-resistant in a way float pooling can never be.
+## The Insight
 
-## The Key Insight
+Ternary pooling has a superpower: **majority voting**. In float space, "major vote" is meaningless — values are continuous. In ternary space, every element casts one of three votes: negative, neutral, or positive. Aggregating by majority is the Condorcet jury theorem applied to neural network features: if each element is more likely right than wrong, the majority is almost certainly right, and the error rate drops exponentially with window size.
 
-Ternary pooling has a superpower that float pooling lacks: **the zero trit is a meaningful signal, not just "small."** In a float network, values near zero are weak activations. In a ternary network, zero means "neutral" — it's a first-class opinion. This makes majority voting (count {-1, 0, +1} and pick the winner) a principled, robust pooling operation. It's the Condorcet jury theorem applied to neural network features.
+This is why majority pooling is the star of this crate. It's noise-resistant in a way float pooling can never be: a single stray activation can't override a clear majority. For ternary networks where quantization noise is the primary failure mode, this is the right default.
 
-## Quick Start
+The second insight: average pooling in ternary space is just `sign(sum)`. The average of {-1, 0, +1} values is {-1, 0, +1} after rounding. No floating point needed — you sum integers and check the sign. This is O(1) per element with no division.
 
-```toml
-[dependencies]
-ternary-pool = "0.1"
-```
+## How It Works
+
+Eight pooling operations, four categories:
+
+### Windowed Pooling (2D, kernel × kernel, stride)
+
+Each operation slides a window across the matrix and produces one output trit per window:
+
+| Operation | Semantics | Output rule |
+|-----------|-----------|-------------|
+| `max_pool` | Strongest positive signal | `max(window)` where 1 > 0 > -1 |
+| `min_pool` | Strongest negative signal | `min(window)` where -1 < 0 < 1 |
+| `majority_pool` | Consensus vote | Count {-1, 0, +1}, pick the most common. Tie-break: 0 > 1 > -1 |
+| `avg_pool` | Sign of the sum | `sign(Σ window)` — positive→1, zero→0, negative→-1 |
+| `stochastic_pool` | Weighted random sample | Sample proportional to `v+1` (weights: -1→0, 0→1, +1→2). Seeded for reproducibility |
+
+### Global Pooling (entire matrix → one trit)
+
+`global_avg_pool`, `global_max_pool`, `global_min_pool`, `global_majority_pool` — same semantics, applied to the whole matrix.
+
+### Adaptive Pooling (arbitrary target size)
+
+`adaptive_avg_pool`, `adaptive_max_pool` — divide the input into `(target_rows × target_cols)` regions and pool each region. Handles non-divisible sizes by partitioning into approximately equal regions.
+
+### The rounding rule
+
+Average pooling uses `round_to_trit`: sum < 0 → -1, sum = 0 → 0, sum > 0 → 1. This is sign-of-sum, not arithmetic mean. For a 2×2 window of {1, 1, -1, -1}, the sum is 0 → output 0. The information that both extremes were present is lost. This is by design: the output must be ternary, and 0 is the honest answer when signal cancels.
+
+## Code Example
 
 ```rust
 use ternary_pool::*;
@@ -32,194 +56,107 @@ let input = TernaryMatrix::from_vec(4, 4, vec![
      1,  0, -1,  1,
 ]);
 
-// Standard pooling
-let maxed   = max_pool(&input, 2, 2);     // strongest positive signal
-let mined   = min_pool(&input, 2, 2);     // strongest negative signal
-let maj     = majority_pool(&input, 2, 2); // the vote winner
-let avg     = avg_pool(&input, 2, 2);      // sign of the sum
+// Windowed pooling (2×2 kernel, stride 2)
+let maxed = max_pool(&input, 2, 2);      // strongest positive per window
+let mined = min_pool(&input, 2, 2);      // strongest negative per window
+let maj   = majority_pool(&input, 2, 2); // vote winner per window
+let avg   = avg_pool(&input, 2, 2);      // sign of sum per window
 
-// Global pooling — collapse entire matrix to one trit
-let g_avg = global_avg_pool(&input);       // balanced summary
-let g_max = global_max_pool(&input);       // any +1 present?
-let g_min = global_min_pool(&input);       // any -1 present?
-let g_maj = global_majority_pool(&input);  // overall consensus
+assert_eq!(maxed.get(0, 0), 1);  // window {1,-1,0,0}: max = 1
+assert_eq!(mined.get(0, 0), -1); // window {1,-1,0,0}: min = -1
 
-// Adaptive — pool to arbitrary target dimensions
-let adapted = adaptive_avg_pool(&input, 2, 2);
+// Global pooling — entire matrix to one trit
+let g_max = global_max_pool(&input);       // 1 (at least one +1 exists)
+let g_min = global_min_pool(&input);       // -1 (at least one -1 exists)
+let g_avg = global_avg_pool(&input);       // sign of total sum
+let g_maj = global_majority_pool(&input);  // most common trit overall
 
-// Stochastic — regularization-friendly, seeded for reproducibility
-let stoch = stochastic_pool(&input, 2, 2, 42);
+// Adaptive — pool to specific output dimensions
+let adapted = adaptive_avg_pool(&input, 2, 2);  // 2×2 output
+
+// Stochastic — reproducible randomness, regularization-friendly
+let s1 = stochastic_pool(&input, 2, 2, 42);
+let s2 = stochastic_pool(&input, 2, 2, 42);
+assert_eq!(s1, s2);  // same seed → same result
+
+// Construction helpers
+let zeros = TernaryMatrix::zeros(6, 6);
+let random = TernaryMatrix::random(6, 6, 12345);
 ```
 
-## Architecture
+## Module Map
 
 ```
-                  ┌──────────────────┐
-                  │  TernaryMatrix   │
-                  └────────┬─────────┘
-                           │
-         ┌─────────────────┼──────────────────┐
-         │                 │                  │
-   ┌─────▼─────┐   ┌──────▼──────┐   ┌──────▼──────┐
-   │  Max Pool  │   │  Min Pool   │   │  Majority   │
-   │  (strongest│   │  (strongest │   │  Pool       │
-   │   positive)│   │   negative) │   │  (vote)     │
-   └───────────┘   └─────────────┘   └─────────────┘
-         │                 │                  │
-   ┌─────▼─────┐   ┌──────▼──────┐   ┌──────▼──────┐
-   │  Avg Pool  │   │  Global     │   │  Stochastic │
-   │  (sign of  │   │  (entire    │   │  (sampled,  │
-   │   sum)     │   │   matrix)   │   │   seeded)   │
-   └───────────┘   └─────────────┘   └─────────────┘
-                           │
-                    ┌──────▼──────┐
-                    │  Adaptive   │
-                    │  (arbitrary │
-                    │   target)   │
-                    └─────────────┘
+ternary_pool
+├── TernaryMatrix
+│   ├── zeros(rows, cols)
+│   ├── from_vec(rows, cols, data: Vec<i8>)  — asserts all values in {-1,0,1}
+│   ├── random(rows, cols, seed)              — seeded PRNG, uniform over {-1,0,1}
+│   ├── get(r, c) → i8
+│   ├── set(r, c, v)
+│   ├── rows() / cols()
+│   └── window(r, c, h, w) → Vec<i8>         — extract sub-matrix (private)
+│
+├── Windowed Pooling
+│   ├── max_pool(input, kernel, stride) → TernaryMatrix
+│   ├── min_pool(input, kernel, stride) → TernaryMatrix
+│   ├── majority_pool(input, kernel, stride) → TernaryMatrix
+│   ├── avg_pool(input, kernel, stride) → TernaryMatrix
+│   └── stochastic_pool(input, kernel, stride, seed) → TernaryMatrix
+│
+├── Global Pooling
+│   ├── global_avg_pool(input) → i8
+│   ├── global_max_pool(input) → i8
+│   ├── global_min_pool(input) → i8
+│   └── global_majority_pool(input) → i8
+│
+├── Adaptive Pooling
+│   ├── adaptive_avg_pool(input, target_rows, target_cols) → TernaryMatrix
+│   └── adaptive_max_pool(input, target_rows, target_cols) → TernaryMatrix
+│
+└── Internal
+    └── round_to_trit(v: i32) → i8         — negative→-1, zero→0, positive→1
 ```
 
-## Strategy Guide
+## Design Decisions
 
-### Max Pool: Detect Presence
+**Majority tie-breaking: 0 > 1 > -1.** When two or three trits tie in count, neutral wins over positive, positive wins over negative. The rationale: in the absence of clear signal, "no opinion" (0) is a safer default than committing to a direction. This bias matters — you can argue for 1 > 0 > -1 (optimistic) or -1 > 0 > 1 (pessimistic) depending on the application. The choice is arbitrary but consistent.
 
-Selects the largest trit: 1 > 0 > -1. Every non-overlapping window contributes one value. If *any* position in the window is +1, that's what you get.
+**Stochastic pooling uses `v+1` weighting: -1→0, 0→1, +1→2.** This means -1 is *never* sampled (weight 0). The -1 trit is treated as pure noise — it contributes to the probability distribution but can't be the output. This is a design choice, not a mathematical necessity. It makes stochastic pooling a one-sided operation: it samples from {0, +1} only.
 
-**Use when:** You care whether a positive feature exists anywhere in the region. Object detection, presence triggers.
+**No padding.** Windows that don't fit are simply not computed. The output size is `(rows - kernel) / stride + 1`. If you need padding, pre-pad the `TernaryMatrix` with zeros before calling the pool function.
 
-### Min Pool: Detect Absence
+**Separate global functions, not methods on TernaryMatrix.** Pooling operations are free functions that take `&TernaryMatrix`. This keeps `TernaryMatrix` as a plain data container and lets the pool functions compose freely.
 
-The mirror of max pool. Selects the smallest trit: -1 < 0 < 1.
+**Linear congruential generator (LCG) for stochastic pooling.** The PRNG is `state = state * 6364136223846793005 + 1442695040888963407`. This is a fast, deterministic, no-allocation generator. It's not cryptographically secure — it doesn't need to be. The seed makes experiments reproducible.
 
-**Use when:** You need to know if negative evidence (inhibition) exists. Complementary to max pool in dual-channel architectures.
+**HashMap for majority counts.** With only 3 possible keys, a HashMap is overkill — three counters would be faster. The HashMap approach is cleaner code and the performance difference is negligible for typical window sizes. If this becomes a bottleneck, replace with three `usize` counters.
 
-### Majority Pool: The Condorcet Voter
+## Status
 
-Counts occurrences of each trit in the window. The winner takes the position. Tie-breaking: 0 > 1 > -1 (neutral before positive, positive before negative).
+| Aspect | State |
+|--------|-------|
+| Max / Min pool | Stable, tested |
+| Majority pool | Stable, tested |
+| Average pool | Stable, tested |
+| Global pool (4 variants) | Stable, tested |
+| Adaptive pool | Stable, tested |
+| Stochastic pool | Stable, tested |
+| Padding modes | Not supported |
+| Fractional strides | Not supported |
+| Learnable pooling | Not supported |
+| Backpropagation | Not supported |
+| MSRV | Edition 2024 |
+| Tests | 20 |
 
-This is **uniquely ternary** — there's no float analog because float values don't form a discrete consensus space. It's naturally robust to noise: a single stray activation can't override a clear majority.
+**Known limitations:** No padding means input dimensions must accommodate the kernel. Stochastic pooling never outputs -1 due to zero weighting. The crate operates on CPU with no SIMD or parallel computation. The `TernaryMatrix` type is row-major with no stride support — submatrices require copying.
 
-**Use when:** Noise resistance matters. Individual ternary activations are noisy; majority voting smooths them out.
+## Related Crates
 
-### Average Pool: The Sign Vote
-
-Computes the integer sum and maps via sign: negative → -1, zero → 0, positive → +1. Equivalent to a weighted vote where each trit votes with its sign.
-
-**Use when:** You want balanced representation. Classification heads (global average pooling → logit).
-
-### Global Pool: Full Collapse
-
-Reduces the entire matrix to one trit. Four variants: avg, max, min, majority.
-
-**Use when:** You need a single summary statistic. Final layer before a ternary classifier.
-
-### Adaptive Pool: Flexible Sizing
-
-Pools to any target (rows, cols), regardless of input dimensions. Divides the input into approximately equal regions.
-
-**Use when:** You need a specific output size and don't want to manually compute kernel/stride. Before fully-connected layers.
-
-### Stochastic Pool: Built-in Regularization
-
-Samples from the window proportional to `v + 1`, giving weights {0, 1, 2} for {-1, 0, +1}. The value -1 is *never* selected. Zero is sometimes selected. +1 is most likely.
-
-**Use when:** You want regularization during training (prevents co-adaptation). Deterministic with seed — reproducible experiments.
-
-## API Reference
-
-### Standard Pooling
-
-```rust
-fn max_pool(input: &TernaryMatrix, kernel: usize, stride: usize) -> TernaryMatrix;
-fn min_pool(input: &TernaryMatrix, kernel: usize, stride: usize) -> TernaryMatrix;
-fn majority_pool(input: &TernaryMatrix, kernel: usize, stride: usize) -> TernaryMatrix;
-fn avg_pool(input: &TernaryMatrix, kernel: usize, stride: usize) -> TernaryMatrix;
-fn stochastic_pool(input: &TernaryMatrix, kernel: usize, stride: usize, seed: u64) -> TernaryMatrix;
-```
-
-### Global Pooling
-
-```rust
-fn global_avg_pool(input: &TernaryMatrix) -> i8;
-fn global_max_pool(input: &TernaryMatrix) -> i8;
-fn global_min_pool(input: &TernaryMatrix) -> i8;
-fn global_majority_pool(input: &TernaryMatrix) -> i8;
-```
-
-### Adaptive Pooling
-
-```rust
-fn adaptive_avg_pool(input: &TernaryMatrix, target_rows: usize, target_cols: usize) -> TernaryMatrix;
-fn adaptive_max_pool(input: &TernaryMatrix, target_rows: usize, target_cols: usize) -> TernaryMatrix;
-```
-
-### Core Type
-
-```rust
-struct TernaryMatrix { /* rows, cols, data: Vec<i8> */ }
-
-impl TernaryMatrix {
-    fn zeros(rows: usize, cols: usize) -> Self;
-    fn from_vec(rows: usize, cols: usize, data: Vec<i8>) -> Self;
-    fn random(rows: usize, cols: usize, seed: u64) -> Self;
-    fn get(&self, r: usize, c: usize) -> i8;
-    fn set(&mut self, r: usize, c: usize, v: i8);
-}
-```
-
-## Real-World Example: Ternary Majority Voting for Sensor Fusion
-
-Three acoustic sensors on a wildlife monitoring station each classify a sound as "predator" (+1), "unknown" (0), or "prey" (-1). They're noisy individually — wind, interference, distance. But by pooling their ternary outputs with majority voting:
-
-```rust
-let sensor_a = TernaryMatrix::from_vec(1, 1, vec![1]);   // predator
-let sensor_b = TernaryMatrix::from_vec(1, 1, vec![-1]);  // prey (wrong)
-let sensor_c = TernaryMatrix::from_vec(1, 1, vec![1]);   // predator
-
-let fused = TernaryMatrix::from_vec(1, 3, vec![1, -1, 1]);
-let consensus = majority_pool(&fused, 3, 1);
-// → 1 (predator wins 2-1)
-
-// Equivalently: global majority vote
-let all_sensors = TernaryMatrix::from_vec(3, 1, vec![1, -1, 1]);
-let vote = global_majority_pool(&all_sensors); // → 1
-```
-
-A single sensor error can't override the majority. That's the power of ternary voting — it's Condorcet's theorem in action, and it's why ternary networks are surprisingly robust to quantization noise.
-
-## Performance Characteristics
-
-- **Max/Min Pool**: O(H × W × k²) — one comparison per element per window. Trivially parallelizable.
-- **Majority Pool**: O(H × W × k²) — counts via HashMap, slightly more overhead than max/min.
-- **Average Pool**: O(H × W × k²) — integer addition + sign check. No division needed (sign of sum).
-- **Stochastic Pool**: O(H × W × k²) — adds PRNG sampling per element.
-- **Global Pool**: O(H × W) — single pass over all elements.
-- **Adaptive Pool**: O(H × W) — visits each element exactly once.
-
-Memory: Output is always smaller than input (that's the point). A 4×4 input with 2×2 kernel produces a 2×2 output — 4× reduction.
-
-## Ecosystem Connections
-
-Pooling sits between convolution and classification in the ternary network pipeline:
-
-- [`ternary-conv`](https://github.com/SuperInstance/ternary-conv) — produces the feature maps this crate downsamples
-- [`ternary-matmul`](https://github.com/SuperInstance/ternary-matmul) — fully-connected layers after global pooling
-- [`ternary-norm`](https://github.com/SuperInstance/ternary-norm) — normalize before or after pooling
-- [`ternary-activation`](https://github.com/SuperInstance/ternary-activation) — apply non-linearity after pooling
-
-## Open Questions
-
-- **Learnable pooling**: Can the tie-breaking order (0 > 1 > -1) be learned? Different tasks might prefer different biases.
-- **Fractional strides**: Currently stride must evenly divide the input minus kernel. Fractional strides could enable smoother downsampling.
-- **Mixed-precision pooling**: Pool ternary activations with float statistics for gradient computation (straight-through estimator).
-
-## Testing
-
-```bash
-cargo test
-```
-
-20 tests covering: max/min on known matrices, all-negative/all-positive edge cases, majority vote counts and tie-breaking, average rounding (positive/negative/zero sums), all global variants, adaptive with divisible and non-divisible sizes, stochastic determinism with same seed, stride effects on output dimensions, and all outputs validated as ternary.
+- **[ternary-conv](https://github.com/SuperInstance/ternary-conv)** — Produces the feature maps this crate downsamples
+- **[ternary-regression](https://github.com/SuperInstance/ternary-regression)** — Predict continuous targets from pooled features
+- **[ternary-logistic](https://github.com/SuperInstance/ternary-logistic)** — Classify after global pooling
+- **[ternary-norm](https://github.com/SuperInstance/ternary-norm)** — Normalize before or after pooling
 
 ## License
 
